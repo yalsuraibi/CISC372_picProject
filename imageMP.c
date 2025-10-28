@@ -3,16 +3,14 @@
 #include <time.h>
 #include <string.h>
 #include "image.h"
-#include <pthread.h>
-#include <unistd.h>
-
+#include <omp.h>
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
-//An array of kernel matrices to be used for image convolution.  
+//An array of kernel matrices to be used for image convolution.
 //The indexes of these match the enumeration from the header file. ie. algorithms[BLUR] returns the kernel corresponding to a box blur.
 Matrix algorithms[]={
     {{0,-1,0},{-1,4,-1},{0,-1,0}},
@@ -22,78 +20,6 @@ Matrix algorithms[]={
     {{-2,-1,0},{-1,1,1},{0,1,2}},
     {{0,0,0},{0,1,0},{0,0,0}}
 };
-
-
-
-typedef struct {
-    Image* srcImage;
-    Image* destImage;
-    Matrix algorithm;
-    int row_start;    
-    int row_end;       
-} WorkerArgs;
-
-
-static void* worker(void* arg_void) {
-    WorkerArgs* a = (WorkerArgs*)arg_void;
-    Image* src = a->srcImage;
-    Image* dst = a->destImage;
-
-    for (int row = a->row_start; row < a->row_end; row++) {
-        for (int pix = 0; pix < src->width; pix++) {
-            for (int bit = 0; bit < src->bpp; bit++) {
-                dst->data[Index(pix,row,src->width,bit,src->bpp)]
-                    = getPixelValue(src, pix, row, bit, a->algorithm);
-            }
-        }
-    }
-    return NULL;
-}
-
-
-
-//splits rows across threads
-static void convolute_mt(Image* srcImage, Image* destImage, Matrix algorithm, int num_threads) {
-    if (num_threads < 1) num_threads = 1;
-    if (num_threads == 1) {
-        // single-thread
-        WorkerArgs a = {srcImage, destImage, {0}, 0, srcImage->height};
-        memcpy(a.algorithm, algorithm, sizeof(Matrix));
-        worker(&a);
-        return;
-    }
-
-    pthread_t* tids = (pthread_t*)malloc(sizeof(pthread_t)*num_threads);
-    WorkerArgs* args = (WorkerArgs*)malloc(sizeof(WorkerArgs)*num_threads);
-
-    int H = srcImage->height;
-    int chunk = H / num_threads;
-    int rem = H % num_threads;
-
-    for (int t = 0, row = 0; t < num_threads; t++) {
-        int take = chunk + (t < rem ? 1 : 0);
-        args[t].srcImage = srcImage;
-        args[t].destImage = destImage;
-        memcpy(args[t].algorithm, algorithm, sizeof(Matrix));
-        args[t].row_start = row;
-        args[t].row_end = row + take;
-        row += take;
-        pthread_create(&tids[t], NULL, worker, &args[t]);
-    }
-
-    for (int t = 0; t < num_threads; t++) {
-        pthread_join(tids[t], NULL);
-    }
-
-    free(tids);
-    free(args);
-}
-
-
-
-
-
-
 
 
 //getPixelValue - Computes the value of a specific pixel on a specific channel using the selected convolution kernel
@@ -124,26 +50,19 @@ uint8_t getPixelValue(Image* srcImage,int x,int y,int bit,Matrix algorithm){
         algorithm[2][2]*srcImage->data[Index(px,py,srcImage->width,bit,srcImage->bpp)];
     return result;
 }
-/*
-//convolute:  Applies a kernel matrix to an image
-//Parameters: srcImage: The image being convoluted
-//            destImage: A pointer to a  pre-allocated (including space for the pixel array) structure to receive the convoluted image.  It should be the same size as srcImage
-//            algorithm: The kernel matrix to use for the convolution
-//Returns: Nothing
-void convolute(Image* srcImage,Image* destImage,Matrix algorithm){
-    int row,pix,bit,span;
-    span=srcImage->bpp*srcImage->bpp;
-    for (row=0;row<srcImage->height;row++){
-        for (pix=0;pix<srcImage->width;pix++){
-            for (bit=0;bit<srcImage->bpp;bit++){
-                destImage->data[Index(pix,row,srcImage->width,bit,srcImage->bpp)]=getPixelValue(srcImage,pix,row,bit,algorithm);
+
+static void convolute_omp(Image* srcImage, Image* destImage, Matrix algorithm){
+    // The only writes are to destImage at (x,y,bit) for this y, so no races.
+    #pragma omp parallel for schedule(static)
+    for (int row = 0; row < srcImage->height; row++){
+        for (int pix = 0; pix < srcImage->width; pix++){
+            for (int bit = 0; bit < srcImage->bpp; bit++){
+                destImage->data[Index(pix,row,srcImage->width,bit,srcImage->bpp)] =
+                    getPixelValue(srcImage, pix, row, bit, algorithm);
             }
         }
     }
 }
-
-*/
-
 
 //Usage: Prints usage information for the program
 //Returns: -1
@@ -170,7 +89,7 @@ int main(int argc,char** argv){
     long t1,t2;
     t1=time(NULL);
 
-    stbi_set_flip_vertically_on_load(0); 
+    stbi_set_flip_vertically_on_load(0);
     if (argc!=3) return Usage();
     char* fileName=argv[1];
     if (!strcmp(argv[1],"pic4.jpg")&&!strcmp(argv[2],"gauss")){
@@ -178,21 +97,7 @@ int main(int argc,char** argv){
     }
     enum KernelTypes type=GetKernelType(argv[2]);
 
-
-    //Used the help of CHATGPT to determine how to set the number of threads to the system # of cores:
-    //
-     int threads = 0;
-    if (argc==4) {
-        threads = atoi(argv[3]);
-        if (threads < 1) threads = 1;
-    } else {
-        long n = sysconf(_SC_NPROCESSORS_ONLN);
-        threads = (n > 0) ? (int)n : 4;
-    }
-
-
-
-    Image srcImage,destImage,bwImage;   
+    Image srcImage,destImage,bwImage;
     srcImage.data=stbi_load(fileName,&srcImage.width,&srcImage.height,&srcImage.bpp,0);
     if (!srcImage.data){
         printf("Error loading file %s.\n",fileName);
@@ -202,12 +107,18 @@ int main(int argc,char** argv){
     destImage.height=srcImage.height;
     destImage.width=srcImage.width;
     destImage.data=malloc(sizeof(uint8_t)*destImage.width*destImage.bpp*destImage.height);
-    convolute_mt(&srcImage,&destImage,algorithms[type],threads);
+    convolute_omp(&srcImage, &destImage, algorithms[type]);
     stbi_write_png("output.png",destImage.width,destImage.height,destImage.bpp,destImage.data,destImage.bpp*destImage.width);
     stbi_image_free(srcImage.data);
-    
+
     free(destImage.data);
     t2=time(NULL);
-    printf("Threads: %d | Took %ld seconds\n", threads, t2-t1);
+    int used = 1;
+    #pragma omp parallel
+    {
+        #pragma omp single
+        used = omp_get_num_threads();
+    }
+    printf("OpenMP threads: %d | Took %ld seconds\n", used, t2 - t1);
    return 0;
 }
